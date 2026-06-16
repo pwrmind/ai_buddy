@@ -1,7 +1,8 @@
 import os
 import sys
+import re
 
-# 1. Специфичный для Windows фикс путей CUDA (до импорта тяжелых библиотек)
+# 1. Специфичный для Windows фикс путей CUDA (выполняется до импорта тяжелых библиотек)
 if sys.platform == "win32":
     scripts_dir = os.path.dirname(sys.executable)
     venv_root = os.path.dirname(scripts_dir) 
@@ -22,7 +23,7 @@ if sys.platform == "win32":
         os.environ["PATH"] = ";".join(paths_to_add) + ";" + current_path
         print("[СИСТЕМА]: Библиотеки CUDA успешно зарегистрированы в PATH процесса.")
 
-# 2. Стандартные импорты
+# 2. Основные импорты
 import io
 import wave
 import pyaudio
@@ -33,32 +34,41 @@ from faster_whisper import WhisperModel
 # --- НАСТРОЙКИ ---
 MODEL_NAME = "gemma4:e4b-it-q4_K_M"
 
-# Инициализация TTS
-engine = pyttsx3.init()
-voices = engine.getProperty('voices')
-for voice in voices:
-    if "Russian" in voice.name or "ru" in voice.languages:
-        engine.setProperty('voice', voice.id)
-        break
-engine.setProperty('rate', 180)
-
-# Инициализация Faster Whisper (теперь библиотеки гарантированно найдутся)
+# 3. Инициализация Faster Whisper на GPU NVIDIA
 whisper_model = WhisperModel("base", device="cuda", compute_type="float16")
 
-# Настройки аудиозахвата
+# Настройки аудиозахвата для режима Hands-free
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-SILENCE_THRESHOLD = 500  # Поднимите до 800+, если микрофон ловит эхо от колонок
-SILENCE_LIMIT = 1.3      # Секунды тишины для отсечки фразы
+SILENCE_THRESHOLD = 500  # Чувствительность к шуму.
+SILENCE_LIMIT = 1.3      # Секунды тишины, после которых фраза считается законченной
 
 def speak(text):
+    """Вывод текста в консоль и надежная озвучка с переинициализацией движка"""
     print(f"ИИ: {text}")
+    
+    try:
+        engine = pyttsx3.init(driverName='sapi5') 
+    except Exception:
+        engine = pyttsx3.init()
+        
+    voices = engine.getProperty('voices')
+    for voice in voices:
+        if "Russian" in voice.name or "ru" in voice.languages or "IRINA" in voice.id.upper() or "PAVEL" in voice.id.upper():
+            engine.setProperty('voice', voice.id)
+            break
+            
+    engine.setProperty('rate', 180)
+    engine.setProperty('volume', 1.0)
+    
     engine.say(text)
     engine.runAndWait()
+    del engine
 
 def record_audio():
+    """Запись звука с микрофона. Автоматический стоп, когда пользователь замолчал"""
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
     
@@ -100,9 +110,19 @@ def record_audio():
 def main():
     print(f"=== Голосовой чат запущен. Модель: {MODEL_NAME} ===")
     
+    # Инициализация истории диалога с системным промптом
+    messages = [
+        {
+            "role": "system",
+            "content": "Ты — краткий, чуткий и емкий голосовой ассистент. Отвечай только текстом на русском языке, понятным для чтения вслух. Категорически не используй Markdown разметку, списки, формулы, звездочки (*) или решетки (#). Твои ответы должны быть не длиннее 2-3 предложений, чтобы их было комфортно слушать."
+        }
+    ]
+    
     while True:
+        # Шаг 1: Запись фразы
         audio_data = record_audio()
         
+        # Шаг 2: Расшифровка на видеокарте через CUDA
         print("[Распознаю речь...]")
         segments, _ = whisper_model.transcribe(audio_data, language="ru")
         user_text = "".join([segment.text for segment in segments]).strip()
@@ -112,19 +132,41 @@ def main():
             
         print(f"Вы: {user_text}")
         
-        if any(word in user_text.lower() for word in ["выход", "стоп", "пока"]):
+        # Умная проверка стоп-слов с помощью регулярных выражений (\b защищает от ложных срабатываний)
+        is_exit_command = False
+        for word in ["выход", "стоп", "пока"]:
+            if re.search(r'\b' + re.escape(word) + r'\b', user_text.lower()):
+                # Игнорируем «пока», если дальше идут уточняющие слова (пока я, пока что и т.д.)
+                if word == "пока" and re.search(r'\bпока\s+(что|я|мы|ты|вы|не|хочу|можно|давай)\b', user_text.lower()):
+                    continue
+                is_exit_command = True
+                break
+
+        if is_exit_command:
             speak("Отключаюсь. До связи!")
             break
             
+        # Добавляем реплику пользователя в память диалога
+        messages.append({"role": "user", "content": user_text})
+        
+        # Шаг 3: Запрос к Gemma 4 через ollama.chat с передачей ВСЕЙ истории
         print("[Gemma думает...]")
         try:
-            response = ollama.generate(
+            response = ollama.chat(
                 model=MODEL_NAME, 
-                prompt=user_text,
-                system="Ты — краткий и емкий голосовой ассистент. Отвечай только текстом на русском языке, понятным для чтения вслух. Категорически не используй Markdown разметку, списки, формулы, звездочки (*) или решетки (#)."
+                messages=messages
             )
-            ai_text = response['response']
+            ai_text = response['message']['content']
+            
+            # Добавляем ответ ИИ в память диалога для сохранения контекста
+            messages.append({"role": "assistant", "content": ai_text})
+            
+            # Шаг 4: Озвучка ответа
             speak(ai_text)
+            
+            # Ограничиваем длину истории (опционально), чтобы не перегружать контекст бесконечно
+            if len(messages) > 21:  # Храним системный промпт + последние 10 раундов диалога
+                messages = [messages[0]] + messages[-20:]
             
         except Exception as e:
             print(f"Ошибка Ollama: {e}")
